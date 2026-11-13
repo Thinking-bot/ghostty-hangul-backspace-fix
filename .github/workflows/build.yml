@@ -108,7 +108,10 @@ jobs:
       - name: Build Ghostty.app
         run: |
           cd ghostty/macos
-          xcodebuild -target Ghostty -configuration ReleaseLocal -arch arm64
+          # CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO keeps Xcode from adding the
+          # get-task-allow (debugger attach) entitlement to the app.
+          xcodebuild -target Ghostty -configuration ReleaseLocal -arch arm64 \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
 
       - name: Smoke test and package
         run: |
@@ -117,25 +120,19 @@ jobs:
           out="$PWD/out"
           mkdir -p "$out"
 
-          echo "== as built (ReleaseLocal)"
+          echo "== signature"
+          codesign --verify --strict --verbose=2 "$app"
           codesign -dvv "$app" 2>&1 | grep -E "Identifier|flags|Signature|TeamIdentifier" || true
-          "$app/Contents/MacOS/ghostty" +version
-          ditto -c -k --keepParent "$app" "$out/Ghostty-jamofix-local.zip"
 
-          # Try the stricter signature too: same entitlements as the official
-          # release (library validation stays ON). Only shipped if it starts.
-          strict_dir="$RUNNER_TEMP/strict"
-          mkdir -p "$strict_dir"
-          cp -R "$app" "$strict_dir/Ghostty.app"
-          strict="no"
-          if codesign --force --sign - --options runtime --timestamp=none \
-               --entitlements ghostty/macos/Ghostty.entitlements \
-               "$strict_dir/Ghostty.app" \
-             && codesign --verify --strict --verbose=2 "$strict_dir/Ghostty.app" \
-             && "$strict_dir/Ghostty.app/Contents/MacOS/ghostty" +version; then
-            strict="yes"
-            ditto -c -k --keepParent "$strict_dir/Ghostty.app" "$out/Ghostty-jamofix-strict.zip"
+          echo "== entitlements"
+          codesign -d --entitlements - "$app" 2>/dev/null | grep -oE "com\.apple\.security\.[A-Za-z0-9.-]+" | sort -u | tee "$RUNNER_TEMP/entitlements.txt"
+          if grep -q "get-task-allow" "$RUNNER_TEMP/entitlements.txt"; then
+            echo "error: the app must not carry the get-task-allow entitlement"
+            exit 1
           fi
+
+          "$app/Contents/MacOS/ghostty" +version
+          ditto -c -k --keepParent "$app" "$out/Ghostty-jamofix.zip"
 
           {
             echo "source repo:    $GHOSTTY_REPO"
@@ -144,7 +141,6 @@ jobs:
             echo "run:            $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "xcode:          $(xcodebuild -version | tr '\n' ' ')"
             echo "zig:            $(zig version)"
-            echo "strict variant starts: $strict"
             echo
             echo "patch sha256:"
             shasum -a 256 fix/patches/*.patch

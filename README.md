@@ -56,8 +56,21 @@ The patch adds unit tests for the new helper in `SurfaceViewAppKitTests`.
 
 No secrets are used and the workflow token is read-only.
 
+## Verified
+
+Tested by hand on macOS 27.2.1 (Apple silicon) with the built-in 2-Set Korean input method:
+
+- `ㅇ` then Backspace once: the jamo is removed.
+- `안` then Backspace three times: `안` → `아` → `ㅇ` → (empty).
+- Space, Enter and arrow keys after a syllable behave as before.
+
+The unit tests in `SurfaceViewAppKitTests` (including the six added by the patch) pass in CI.
+
 ## Caveats
 
 - The app is ad-hoc signed. It is not signed with Ghostty's Developer ID and not notarized by Apple.
+- Like upstream's own `ReleaseLocal` builds, it runs with library validation disabled, because an
+  ad-hoc signed app cannot otherwise load its bundled Sparkle framework. The debugger-attach
+  entitlement (`get-task-allow`) is not included; the workflow fails if it is present.
 - Automatic update checks are off in this build. Go back to the official release once the upstream
   fix ships.
