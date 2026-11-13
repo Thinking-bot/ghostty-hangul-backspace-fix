@@ -1,0 +1,160 @@
+diff --git a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift
+index cbec307..a6a272a 100644
+--- a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
++++ b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
+@@ -1181,6 +1181,12 @@ extension Ghostty {
+             // know if these events cleared it.
+             let markedTextBefore = markedText.length > 0
+ 
++            // Snapshot the preedit text itself (a real copy, since markedText
++            // is mutated in place by the input method callbacks) so that we
++            // can tell below whether the input method only committed the
++            // preedit it was asked to delete.
++            let markedStringBefore = String(Array(markedText.string))
++
+             // We need to know the keyboard layout before below because some keyboard
+             // input events will change our keyboard layout and we don't want those
+             // going to the terminal.
+@@ -1223,6 +1229,22 @@ extension Ghostty {
+             if markedTextBefore,
+                let list = keyTextAccumulator,
+                list.count > 0 {
++                // Backspace on the last remaining Hangul jamo: the Korean
++                // input method commits the jamo with insertText and then
++                // hands Backspace back so the client deletes it again. The
++                // terminal never received that text, so the net effect is
++                // "nothing happened". Sending the commit here would make the
++                // jamo reappear as real text and need a second Backspace
++                // (#14797). The preedit was already cleared above.
++                if Ghostty.SurfaceView.isPreeditDeletionCommit(
++                    list,
++                    markedBefore: markedStringBefore,
++                    key: Ghostty.Input.Key(keyCode: translationEvent.keyCode),
++                    mods: translationEvent.modifierFlags
++                ) {
++                    return
++                }
++
+                 for text in list {
+                     if Ghostty.SurfaceView.shouldSuppressComposingControlInput(
+                         text,
+@@ -2191,6 +2213,29 @@ extension Ghostty.SurfaceView: NSTextInputClient {
+         }
+         return scalar.value < 0x20
+     }
++
++    /// True when a plain Backspace made the input method commit exactly the
++    /// preedit text that was on screen before the key was pressed.
++    ///
++    /// The built-in Korean input method does this for the last remaining
++    /// jamo of a syllable: it commits the jamo and then asks the client to
++    /// delete it. Because the terminal has not been sent that text yet, the
++    /// correct result is to send neither the text nor the Backspace.
++    ///
++    /// Modified Backspace (e.g. option+backspace) is excluded because the
++    /// input method hands back a different command for it, such as deleting
++    /// a whole word, which this shortcut would not reproduce.
++    static func isPreeditDeletionCommit(
++        _ committed: [String],
++        markedBefore: String,
++        key: Ghostty.Input.Key?,
++        mods: NSEvent.ModifierFlags
++    ) -> Bool {
++        guard key == .backspace else { return false }
++        guard mods.isDisjoint(with: [.control, .option, .command]) else { return false }
++        guard !markedBefore.isEmpty else { return false }
++        return committed.joined() == markedBefore
++    }
+ }
+ 
+ // MARK: Services
+diff --git a/macos/Tests/Ghostty/SurfaceViewAppKitTests.swift b/macos/Tests/Ghostty/SurfaceViewAppKitTests.swift
+index 03ad635..3559efc 100644
+--- a/macos/Tests/Ghostty/SurfaceViewAppKitTests.swift
++++ b/macos/Tests/Ghostty/SurfaceViewAppKitTests.swift
+@@ -1,3 +1,4 @@
++import AppKit
+ @testable import Ghostty
+ import Testing
+ 
+@@ -41,4 +42,80 @@ struct SurfaceViewAppKitTests {
+             ) == false
+         )
+     }
++
++    // MARK: Backspace on the last Hangul jamo (#14797)
++
++    @Test func dropsCommitWhenBackspaceDeletesTheLastJamo() {
++        #expect(
++            Ghostty.SurfaceView.isPreeditDeletionCommit(
++                ["\u{3147}"],
++                markedBefore: "\u{3147}",
++                key: .backspace,
++                mods: []
++            )
++        )
++    }
++
++    @Test func keepsCommitWhenTextDiffersFromThePreedit() {
++        // e.g. a new syllable started: the previous one is committed and
++        // must still reach the terminal.
++        #expect(
++            Ghostty.SurfaceView.isPreeditDeletionCommit(
++                ["\u{D55C}"],
++                markedBefore: "\u{3147}",
++                key: .backspace,
++                mods: []
++            ) == false
++        )
++    }
++
++    @Test(arguments: [
++        Ghostty.Input.Key.arrowLeft,
++        Ghostty.Input.Key.enter,
++        Ghostty.Input.Key.space,
++        Ghostty.Input.Key.delete,
++    ])
++    func keepsCommitForKeysOtherThanBackspace(key: Ghostty.Input.Key) {
++        #expect(
++            Ghostty.SurfaceView.isPreeditDeletionCommit(
++                ["\u{3147}"],
++                markedBefore: "\u{3147}",
++                key: key,
++                mods: []
++            ) == false
++        )
++    }
++
++    @Test func keepsCommitForModifiedBackspace() {
++        #expect(
++            Ghostty.SurfaceView.isPreeditDeletionCommit(
++                ["\u{3147}"],
++                markedBefore: "\u{3147}",
++                key: .backspace,
++                mods: [.option]
++            ) == false
++        )
++    }
++
++    @Test func keepsCommitWhenThereWasNoPreedit() {
++        #expect(
++            Ghostty.SurfaceView.isPreeditDeletionCommit(
++                [""],
++                markedBefore: "",
++                key: .backspace,
++                mods: []
++            ) == false
++        )
++    }
++
++    @Test func keepsCommitWhenKeyIsUnknown() {
++        #expect(
++            Ghostty.SurfaceView.isPreeditDeletionCommit(
++                ["\u{3147}"],
++                markedBefore: "\u{3147}",
++                key: nil,
++                mods: []
++            ) == false
++        )
++    }
+ }

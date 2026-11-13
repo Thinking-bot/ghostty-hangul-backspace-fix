@@ -1,0 +1,173 @@
+name: build
+
+# Builds the official Ghostty v1.4.0 source plus the single patch in
+# patches/, and uploads the resulting macOS app as an artifact.
+#
+# No secrets are used. The token is read-only.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+env:
+  GHOSTTY_REPO: ghostty-org/ghostty
+  # Tag v1.4.0 ("Bump version to 1.4.0")
+  GHOSTTY_COMMIT: 83fb95624b0439ee660c2679b43b38c8b63769cd
+  GHOSTTY_VERSION: 1.4.0
+  ZIG_VERSION: 0.17.0
+  # From https://ziglang.org/download/index.json (aarch64-macos)
+  ZIG_SHA256: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - name: Checkout this repository (patch + workflow)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fix
+          persist-credentials: false
+
+      - name: Checkout official Ghostty source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GHOSTTY_REPO }}
+          ref: ${{ env.GHOSTTY_COMMIT }}
+          path: ghostty
+          persist-credentials: false
+
+      - name: Verify source commit
+        run: |
+          actual="$(git -C ghostty rev-parse HEAD)"
+          echo "expected: $GHOSTTY_COMMIT"
+          echo "actual:   $actual"
+          test "$actual" = "$GHOSTTY_COMMIT"
+
+      - name: Apply patch
+        run: |
+          cd ghostty
+          for p in ../fix/patches/*.patch; do
+            echo "== $p"
+            shasum -a 256 "$p"
+            git apply --check "$p"
+            git apply "$p"
+          done
+          echo "== files changed relative to the official commit"
+          git status --short
+          git diff --stat
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
+          sw_vers
+          uname -m
+
+      - name: Install Zig (checksum verified)
+        run: |
+          set -euo pipefail
+          name="zig-aarch64-macos-${ZIG_VERSION}"
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/${name}.tar.xz"
+          echo "${ZIG_SHA256}  zig.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components 1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/zig/zig" version
+
+      - name: Install gettext (msgfmt) if missing
+        run: |
+          if ! command -v msgfmt >/dev/null 2>&1; then
+            brew install gettext
+          fi
+          msgfmt --version | head -1
+
+      # GhosttyKit is the Zig core that the Swift app links against.
+      - name: Build GhosttyKit
+        run: |
+          cd ghostty
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Dxcframework-target=native \
+            -Dversion-string="${GHOSTTY_VERSION}"
+
+      # ReleaseLocal is upstream's configuration for release builds that are
+      # not signed with their Developer ID (what `zig build` itself uses).
+      - name: Build Ghostty.app
+        run: |
+          cd ghostty/macos
+          xcodebuild -target Ghostty -configuration ReleaseLocal -arch arm64
+
+      - name: Smoke test and package
+        run: |
+          set -euo pipefail
+          app="ghostty/macos/build/ReleaseLocal/Ghostty.app"
+          out="$PWD/out"
+          mkdir -p "$out"
+
+          echo "== as built (ReleaseLocal)"
+          codesign -dvv "$app" 2>&1 | grep -E "Identifier|flags|Signature|TeamIdentifier" || true
+          "$app/Contents/MacOS/ghostty" +version
+          ditto -c -k --keepParent "$app" "$out/Ghostty-jamofix-local.zip"
+
+          # Try the stricter signature too: same entitlements as the official
+          # release (library validation stays ON). Only shipped if it starts.
+          strict_dir="$RUNNER_TEMP/strict"
+          mkdir -p "$strict_dir"
+          cp -R "$app" "$strict_dir/Ghostty.app"
+          strict="no"
+          if codesign --force --sign - --options runtime --timestamp=none \
+               --entitlements ghostty/macos/Ghostty.entitlements \
+               "$strict_dir/Ghostty.app" \
+             && codesign --verify --strict --verbose=2 "$strict_dir/Ghostty.app" \
+             && "$strict_dir/Ghostty.app/Contents/MacOS/ghostty" +version; then
+            strict="yes"
+            ditto -c -k --keepParent "$strict_dir/Ghostty.app" "$out/Ghostty-jamofix-strict.zip"
+          fi
+
+          {
+            echo "source repo:    $GHOSTTY_REPO"
+            echo "source commit:  $GHOSTTY_COMMIT (v$GHOSTTY_VERSION)"
+            echo "fix repo:       $GITHUB_REPOSITORY @ $GITHUB_SHA"
+            echo "run:            $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "xcode:          $(xcodebuild -version | tr '\n' ' ')"
+            echo "zig:            $(zig version)"
+            echo "strict variant starts: $strict"
+            echo
+            echo "patch sha256:"
+            shasum -a 256 fix/patches/*.patch
+            echo
+            echo "artifact sha256:"
+            (cd "$out" && shasum -a 256 *.zip)
+          } | tee "$out/BUILD_INFO.txt"
+
+      - name: Upload app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ghostty-jamofix
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
+
+      # Runs after the upload so a test-infrastructure problem cannot hide the
+      # app. The result is still reported in the run summary.
+      - name: Unit tests (SurfaceViewAppKitTests)
+        continue-on-error: true
+        run: |
+          cd ghostty/macos
+          xcodebuild test -scheme Ghostty -arch arm64 \
+            -only-testing:GhosttyTests/SurfaceViewAppKitTests \
+            2>&1 | tee "$RUNNER_TEMP/xctest.log" | grep -E "Test (Suite|Case|run)|✔|✘|passed|failed|error:|\*\* TEST" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" "$RUNNER_TEMP/xctest.log"
